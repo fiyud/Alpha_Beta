@@ -17,17 +17,31 @@ import torch.backends.cudnn as cudnn
 from tqdm import tqdm, trange
 
 def load_state_dict(model_dir, is_multi_gpu):
-    state_dict = torch.load(model_dir, map_location=lambda storage, loc: storage)['state_dict']
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    state_dict = torch.load(model_dir, map_location=device)['state_dict']
     if is_multi_gpu:
         new_state_dict = OrderedDict()
         for k, v in state_dict.items():
-            name = k[7:]       # remove `module.`
+            name = k[7:]
             new_state_dict[name] = v
         return new_state_dict
     else:
         return state_dict
 
 def main(args):
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    is_use_cuda = torch.cuda.is_available()
+    
+    if is_use_cuda:
+        torch.cuda.empty_cache()  
+        cudnn.benchmark = True
+        cudnn.deterministic = False
+        print(f"Using CUDA device(s): {args.gpu}")
+        print(f"CUDA device count: {torch.cuda.device_count()}")
+    else:
+        print("CUDA not available, using CPU")
+
     if 0 == len(args.resume):
         logger = Logger('./logs/'+args.model+'.log')
     else:
@@ -74,16 +88,28 @@ def main(args):
     print(f"Train dataset size: {len(train_datasets)}")
     print(f"Validation dataset size: {len(val_datasets)}")
     
-    train_dataloaders = torch.utils.data.DataLoader(train_datasets, batch_size=args.batch_size*len(gpus), shuffle=True, num_workers=8)
-    val_dataloaders = torch.utils.data.DataLoader(val_datasets, batch_size=1024, shuffle=False, num_workers=8)
+    train_dataloaders = torch.utils.data.DataLoader(
+        train_datasets, 
+        batch_size=args.batch_size*len(gpus), 
+        shuffle=True, 
+        num_workers=8,
+        pin_memory=is_use_cuda,
+        persistent_workers=True
+    )
+    val_dataloaders = torch.utils.data.DataLoader(
+        val_datasets, 
+        batch_size=1024, 
+        shuffle=False, 
+        num_workers=8,
+        pin_memory=is_use_cuda,
+        persistent_workers=True
+    )
 
     if args.debug:
         x, y = next(iter(train_dataloaders))
+        if is_use_cuda:
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         logger.append([x, y])
-
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
-    is_use_cuda = torch.cuda.is_available()
-    cudnn.benchmark = True
 
     print(f"Initializing model: {args.model}")
     if 'resnet50' == args.model.split('_')[0]:
@@ -95,12 +121,16 @@ def main(args):
     else:
         raise ModuleNotFoundError("Model not found")
 
-    if is_use_cuda and 1 == len(gpus):
-        my_model = my_model.cuda()
-    elif is_use_cuda and 1 < len(gpus):
-        my_model = nn.DataParallel(my_model.cuda())
+    if is_use_cuda:
+        my_model = my_model.to(device)
+        if len(gpus) > 1:
+            my_model = nn.DataParallel(my_model, device_ids=list(range(len(gpus))))
+        print(f"Model moved to device: {device}")
 
     loss_fn = [nn.CrossEntropyLoss()]
+    if is_use_cuda:
+        loss_fn = [criterion.to(device) for criterion in loss_fn]
+    
     optimizer = optim.SGD(my_model.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4) 
     lr_schedule = lr_scheduler.MultiStepLR(optimizer, milestones=[30, 60], gamma=0.1)
 
@@ -118,7 +148,8 @@ def main(args):
         pbar = tqdm(dataloader, desc="Training", leave=False)
         for i, (inputs, labels) in enumerate(pbar):
             if is_use_cuda:
-                inputs, labels = inputs.cuda(), labels.cuda()
+                inputs = inputs.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
             
             optimizer.zero_grad()
             outputs = model(inputs)
@@ -128,10 +159,17 @@ def main(args):
             loss.backward()
             optimizer.step()
             
-            metric[0].add(outputs.data, labels.data)
+            metric[0].add(outputs.detach().cpu(), labels.detach().cpu())
             total_loss += loss.item()
             
-            pbar.set_postfix({"loss": f"{loss.item():.4f}", "top1": f"{metric[0].value(1):.2f}%", "top5": f"{metric[0].value(5):.2f}%"})
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}", 
+                "top1": f"{metric[0].value(1):.2f}%", 
+                "top5": f"{metric[0].value(5):.2f}%"
+            })
+            
+            if i % 50 == 0 and is_use_cuda:
+                torch.cuda.empty_cache()
         
         return total_loss / len(dataloader), metric
 
@@ -146,15 +184,23 @@ def main(args):
             pbar = tqdm(dataloader, desc="Validation", leave=False)
             for i, (inputs, labels) in enumerate(pbar):
                 if is_use_cuda:
-                    inputs, labels = inputs.cuda(), labels.cuda()
+                    inputs = inputs.to(device, non_blocking=True)
+                    labels = labels.to(device, non_blocking=True)
                 
                 outputs = model(inputs)
                 loss = loss_fn[0](outputs, labels)
                 
-                metric[0].add(outputs.data, labels.data)
+                metric[0].add(outputs.detach().cpu(), labels.detach().cpu())
                 total_loss += loss.item()
                 
-                pbar.set_postfix({"loss": f"{loss.item():.4f}", "top1": f"{metric[0].value(1):.2f}%", "top5": f"{metric[0].value(5):.2f}%"})
+                pbar.set_postfix({
+                    "loss": f"{loss.item():.4f}", 
+                    "top1": f"{metric[0].value(1):.2f}%", 
+                    "top5": f"{metric[0].value(5):.2f}%"
+                })
+                
+                if i % 50 == 0 and is_use_cuda:
+                    torch.cuda.empty_cache()
         
         return total_loss / len(dataloader), metric
     
@@ -177,12 +223,21 @@ def main(args):
             writer.add_scalar('val/top1', val_metric[0].value(1), epoch)
             writer.add_scalar('val/top5', val_metric[0].value(5), epoch)
         
+        # Save model state with proper device handling
+        if is_use_cuda and isinstance(my_model, nn.DataParallel):
+            model_state = my_model.module.state_dict()
+        else:
+            model_state = my_model.state_dict()
+            
         state = {
             'epoch': epoch + 1,
-            'state_dict': my_model.state_dict(),
+            'state_dict': model_state,
             'optimizer': optimizer.state_dict(),
         }
         torch.save(state, f'checkpoints/{args.model}_epoch_{epoch+1}.pth')
+        
+        if is_use_cuda:
+            torch.cuda.empty_cache()
     
     logger.append('Optimize Done!')
 
